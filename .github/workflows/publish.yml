@@ -1,0 +1,268 @@
+# Build and publish @justcrawl/mcp-server to npm with a provenance attestation.
+#
+# The BUILD happens here, in this workflow, and that is the point. This repo is a
+# source mirror, so npm's attestation says "npm built this tarball from this
+# commit of this repo" — a claim a reader can check against source they can read.
+# A prebuilt tree would attest only distribution: true, and far weaker than it
+# looks, since nothing would connect those bytes to any inspectable source.
+#
+# This file is authored in the PRIVATE repo at
+# `libraries/sdk/mcp-server/.github/workflows/publish.yml` and mirrored to the
+# public repo's root by `tooling/scripts/mirror-sdk.sh`. Editing it there is
+# pointless — the next mirror force-push overwrites it. Edit it here.
+#
+# Why it is inside the mirror allowlist at all: leaving it outside means every
+# force-push deletes the release pipeline. That is a bug, not a safety measure.
+#
+# The obvious objection — "this hands npm-publish authority to anyone who can
+# merge to GitLab main" — is answered at the ENVIRONMENT, not at the file: the
+# publish job runs in the `npm-publish` GitHub Environment, which has required
+# reviewers, so a human approves every publish. Editing this workflow is
+# therefore not equivalent to publishing.
+#
+# There is no npm token anywhere in this file. Publishing authenticates by OIDC
+# (npm "trusted publishing"): npm is configured to trust exactly this repo +
+# this workflow filename + this environment, and mints a short-lived credential
+# per run. That is why the `environment:` line below is load-bearing twice over
+# — it gates on a human AND it is part of what npm matches against.
+name: publish
+
+on:
+  push:
+    tags:
+      # The mirror script pushes `mcp-vX.Y.Z` alongside the squashed commit.
+      # Distinct from the SDK mirror's `sdk-v*` because these are different
+      # repositories with different release cadences; sharing a prefix would
+      # make a glance at a tag ambiguous about which package it released.
+      - 'mcp-v*'
+  # Manual re-run for a tag whose publish failed after approval. Never a way to
+  # publish an arbitrary ref: the job still reads the version from the tree and
+  # npm still refuses to overwrite a published version.
+  workflow_dispatch:
+
+# Least privilege at the top; the publish job widens only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    # Runs with NO publish authority — no environment, no id-token, so OIDC
+    # cannot mint a credential here even in principle. A malformed tree fails
+    # here, before any credential is in scope.
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned by full commit SHA, never by tag: a tag is
+      # mutable and a compromised action would run with the publish job's rights
+      # one step later.
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm for trusted publishing
+        # OIDC trusted publishing needs npm >= 11.5.1; Node 22 ships npm 10.x.
+        # Pinned to the major so a breaking npm 12 cannot land here unannounced.
+        run: npm install -g npm@^11
+
+      - name: Install and build
+        # Exactly what the publish job below runs, so a build that cannot succeed
+        # fails HERE — before the publish job can authenticate and before a human
+        # is asked to approve anything.
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm run build
+
+      - name: Assert the tag matches the manifest version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#mcp-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG_VERSION but package.json says $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "publishing version $PKG_VERSION"
+
+      - name: Assert the artifact is correctly named and carries only its two deps
+        # Not "dependency-free" like the SDK: this package legitimately depends on
+        # the MCP SDK and zod. A THIRD entry is the failure — it means something
+        # a customer's install must resolve that nobody decided to ship.
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const fail = (m) => { console.error(m); process.exit(1); };
+            if (pkg.name !== "@justcrawl/mcp-server") fail(`wrong name: ${pkg.name}`);
+            if (pkg.license !== "Apache-2.0") fail(`wrong license: ${pkg.license}`);
+            const deps = Object.keys(pkg.dependencies ?? {}).sort();
+            const expected = ["@modelcontextprotocol/sdk", "zod"];
+            if (JSON.stringify(deps) !== JSON.stringify(expected)) fail(`unexpected dependencies: ${deps.join(", ")}`);
+            if (!pkg.bin || !pkg.bin["justcrawl-mcp-server"]) fail("missing bin — npx would not work");
+            if (pkg.private) fail("private: true would make the publish fail anyway");
+            console.log("manifest ok");
+          '
+
+      - name: Assert the build produced every file the manifest ships
+        # `files` is the contract with npm; a build that silently skipped an
+        # output would publish a tarball missing its own entry point.
+        run: |
+          set -euo pipefail
+          node -e '
+            const { existsSync } = require("fs");
+            const missing = require("./package.json").files.filter((f) => !existsSync(f));
+            if (missing.length > 0) { console.error(`missing: ${missing.join(", ")}`); process.exit(1); }
+            console.log("all published files present");
+          '
+
+      - name: Assert the binary is executable and starts with one shebang
+        # Without a shebang on line 1 `npx` hands the file to the shell and every
+        # line is a syntax error. Two shebangs is worse: the second one is not a
+        # shebang at all, it is a hard parse error partway into the file.
+        run: |
+          set -euo pipefail
+          head -1 index.js | grep -qx '#!/usr/bin/env node' || { echo "missing shebang on line 1" >&2; exit 1; }
+          if [ "$(grep -c '^#!' index.js)" != "1" ]; then
+            echo "expected exactly one shebang line" >&2
+            exit 1
+          fi
+
+      - name: Assert no private package specifier survived the bundle
+        # A bare `@scraperoute/*` specifier would 404 on install. The SDK is
+        # bundled in; nothing may reach for it by name.
+        run: |
+          set -euo pipefail
+          if grep -nE "(from|require\(|import\()[[:space:]]*['\"]@scraperoute/" index.js; then
+            echo "found a private package specifier in the published files" >&2
+            exit 1
+          fi
+          echo "no private specifiers"
+
+      - name: Smoke the built binary
+        # The one check that proves the artifact runs at all: with no API key it
+        # must exit non-zero, name the variable on stderr, and write NOTHING to
+        # stdout — stdout is the JSON-RPC channel and a host reading a non-JSON
+        # byte there reports a parse error instead of the message that fixes it.
+        run: |
+          set -euo pipefail
+          set +e
+          OUT="$(node index.js 2>/tmp/err.txt)"
+          CODE=$?
+          set -e
+          if [ "$CODE" -eq 0 ]; then echo "expected a non-zero exit without an API key" >&2; exit 1; fi
+          if [ -n "$OUT" ]; then echo "wrote to stdout on the failure path: $OUT" >&2; exit 1; fi
+          grep -q 'JUSTCRAWL_API_KEY' /tmp/err.txt || { echo "stderr did not name the variable" >&2; exit 1; }
+          echo "binary smoke ok"
+
+      - name: Pack and show exactly what would ship
+        run: npm pack --dry-run
+
+  publish:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    # The human gate, and half of npm's trusted-publisher match. GitHub blocks
+    # the job until a required reviewer approves — which is what makes "who can
+    # edit the workflow" a different question from "who can publish".
+    # RENAMING THIS BREAKS PUBLISHING: npm's trusted-publisher config for
+    # @justcrawl/mcp-server names this environment literally, alongside the repo
+    # and this file's name. Change it in both places or not at all.
+    environment: npm-publish
+    permissions:
+      contents: read
+      # Only here, and only on this job: the OIDC token npm exchanges for the
+      # provenance attestation.
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Node
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@^11
+
+      - name: Install and build
+        # Rebuilt rather than carried over from `verify` as an artifact: the
+        # attestation must cover what THIS job produced. Passing a tarball
+        # between jobs would put an unattested hop in the middle of the chain
+        # provenance exists to close.
+        #
+        # That rebuild is exactly why the assertions below repeat `verify`'s
+        # rather than trusting them. `needs: [verify]` orders the jobs; it does
+        # not make verify's checks apply to THIS job's independently resolved
+        # install.
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm run build
+
+      - name: Assert the tag matches the manifest version
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#mcp-v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME implies $TAG_VERSION but package.json says $PKG_VERSION" >&2
+            exit 1
+          fi
+          echo "publishing version $PKG_VERSION"
+
+      - name: Assert the artifact is correctly named and carries only its two deps
+        run: |
+          set -euo pipefail
+          node -e '
+            const pkg = require("./package.json");
+            const fail = (m) => { console.error(m); process.exit(1); };
+            if (pkg.name !== "@justcrawl/mcp-server") fail(`wrong name: ${pkg.name}`);
+            if (pkg.license !== "Apache-2.0") fail(`wrong license: ${pkg.license}`);
+            const deps = Object.keys(pkg.dependencies ?? {}).sort();
+            const expected = ["@modelcontextprotocol/sdk", "zod"];
+            if (JSON.stringify(deps) !== JSON.stringify(expected)) fail(`unexpected dependencies: ${deps.join(", ")}`);
+            if (!pkg.bin || !pkg.bin["justcrawl-mcp-server"]) fail("missing bin — npx would not work");
+            if (pkg.private) fail("private: true would make the publish fail anyway");
+            console.log("manifest ok");
+          '
+
+      - name: Assert the build produced every file the manifest ships
+        run: |
+          set -euo pipefail
+          node -e '
+            const { existsSync } = require("fs");
+            const missing = require("./package.json").files.filter((f) => !existsSync(f));
+            if (missing.length > 0) { console.error(`missing: ${missing.join(", ")}`); process.exit(1); }
+            console.log("all published files present");
+          '
+
+      - name: Assert the binary is executable and starts with one shebang
+        run: |
+          set -euo pipefail
+          head -1 index.js | grep -qx '#!/usr/bin/env node' || { echo "missing shebang on line 1" >&2; exit 1; }
+          if [ "$(grep -c '^#!' index.js)" != "1" ]; then
+            echo "expected exactly one shebang line" >&2
+            exit 1
+          fi
+
+      - name: Assert no private package specifier survived the bundle
+        run: |
+          set -euo pipefail
+          if grep -nE "(from|require\(|import\()[[:space:]]*['\"]@scraperoute/" index.js; then
+            echo "found a private package specifier in the published files" >&2
+            exit 1
+          fi
+          echo "no private specifiers"
+
+      - name: Publish with provenance
+        # `--provenance` requires this repo to be public and the workflow to run
+        # on GitHub Actions — which is the entire reason the mirror exists.
+        # Self-hosted GitLab cannot issue a provenance attestation. Because the
+        # build ran in the step above, the attestation binds the tarball to this
+        # repo's SOURCE, not merely to files someone committed.
+        run: npm publish --provenance --access public
