@@ -1,0 +1,54 @@
+{
+  "name": "@justcrawl/mcp-server",
+  "version": "0.2.1",
+  "description": "The official MCP server for JustCrawl — scrape jobs, workflows, and BI from any LLM agent host",
+  "license": "Apache-2.0",
+  "author": "JustCrawl",
+  "homepage": "https://docs.justcrawl.io/guides/agents/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/justcrawl-io/justcrawl-mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/justcrawl-io/justcrawl-mcp-server/issues"
+  },
+  "keywords": [
+    "justcrawl",
+    "mcp",
+    "model-context-protocol",
+    "scraping",
+    "crawler",
+    "agent",
+    "claude",
+    "cursor"
+  ],
+  "type": "module",
+  "bin": {
+    "justcrawl-mcp-server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20.3.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "tsx scripts/build.ts --out ."
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "esbuild": "0.25.12",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3"
+  }
+}
